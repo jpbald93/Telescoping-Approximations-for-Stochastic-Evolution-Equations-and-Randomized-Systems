@@ -1,0 +1,133 @@
+import numpy as np
+
+# Optional but recommended for speed/stability
+from scipy.sparse import diags
+from scipy.sparse.linalg import splu
+
+def laplacian_1d_dirichlet(N: int):
+    """
+    1D Dirichlet Laplacian on (0,1) with N interior points.
+    Returns sparse matrix A approximating d^2/dx^2 with Dirichlet BCs.
+    """
+    h = 1.0 / (N + 1)
+    main = (-2.0 / h**2) * np.ones(N)
+    off  = ( 1.0 / h**2) * np.ones(N - 1)
+    A = diags([off, main, off], offsets=[-1, 0, 1], format="csc")
+    return A, h
+
+def restrict_noise_pairwise(dW_fine: np.ndarray):
+    """
+    Coarsen fine-grid noise increments to a grid with half as many points.
+    If dW_fine ~ N(0, dt I), then
+        dW_coarse_j = (dW_fine_{2j} + dW_fine_{2j+1}) / sqrt(2)
+    preserves variance dt per coarse component (approximate, standard coupling).
+    """
+    Nf = dW_fine.shape[0]
+    assert Nf % 2 == 0, "Fine grid size must be even to restrict by pairs."
+    dW_pairs = dW_fine.reshape(Nf // 2, 2)
+    return dW_pairs.sum(axis=1) / np.sqrt(2.0)
+
+def simulate_level(N: int, dW_path: np.ndarray, dt: float):
+    """
+    Simulate u_t = u_xx + noise on N interior points with implicit Euler:
+        u_{n+1} = (I - dt*A)^{-1} (u_n + dW_n)
+    where A is the FD Laplacian matrix.
+    dW_path has shape (n_steps, N) and represents spatial noise increments.
+    """
+    A, h = laplacian_1d_dirichlet(N)
+    I_minus_dtA = diags([1.0], [0], shape=(N, N), format="csc") - dt * A
+    solver = splu(I_minus_dtA)  # sparse LU factorization
+
+    u = np.zeros(N)
+    for k in range(dW_path.shape[0]):
+        u = solver.solve(u + dW_path[k])
+    return u, h
+
+def coupled_noise_paths(N_levels, dt, n_steps, rng):
+    """
+    Build coupled noise increments on all levels using the finest level as base.
+    N_levels is a list of N values (interior points), e.g. [4,8,16,...,128]
+    """
+    Nfine = N_levels[-1]
+    # Base noise on finest grid: each step is N(0, dt I)
+    dW_fine = rng.normal(size=(n_steps, Nfine)) * np.sqrt(dt)
+
+    # Build coarser noises by repeated restriction
+    noises = {Nfine: dW_fine}
+    current = dW_fine
+    currentN = Nfine
+    # Work downward through levels
+    for N in reversed(N_levels[:-1]):
+        # Ensure currentN is exactly 2*N for clean nesting
+        assert currentN == 2 * N, f"Expected nesting currentN={currentN} = 2*{N}"
+        coarse = np.empty((n_steps, N))
+        for k in range(n_steps):
+            coarse[k] = restrict_noise_pairwise(current[k])
+        noises[N] = coarse
+        current = coarse
+        currentN = N
+    return noises
+
+def l2_norm_sq(v: np.ndarray, h: float):
+    # Discrete L2 norm squared ~ h * sum_j v_j^2
+    return h * np.dot(v, v)
+
+def main():
+    # Experiment parameters (edit as you like)
+    levels = [4, 8, 16, 32, 64, 128]   # interior grid sizes
+    T = 1.0
+    dt = 0.01
+    n_steps = int(T / dt)
+    M = 1000  # Monte Carlo samples (reduce to 200 for quick testing)
+
+    rng = np.random.default_rng(12345)
+
+    # Accumulate V_ell = E ||u_{ell+1}(T) - u_ell(T)||^2
+    V = {N: 0.0 for N in levels[:-1]}  # keyed by coarse N (difference with next finer)
+
+    for m in range(M):
+        noises = coupled_noise_paths(levels, dt, n_steps, rng)
+
+        # Simulate all levels with their coupled noises
+        sol = {}
+        hs = {}
+        for N in levels:
+            uT, h = simulate_level(N, noises[N], dt)
+            sol[N] = uT
+            hs[N] = h
+
+        # Compute differences between consecutive levels
+        # Note: u_{fine} and u_{coarse} live on different grids.
+        # For a simple comparison, restrict the fine solution to coarse grid by pair-averaging.
+        for i in range(len(levels) - 1):
+            Nc = levels[i]
+            Nf = levels[i + 1]
+
+            uf = sol[Nf]
+            uc = sol[Nc]
+
+            # Restrict uf to coarse grid (pairwise average)
+            uf_restricted = uf.reshape(Nc, 2).mean(axis=1)
+
+            diff = uf_restricted - uc
+            V[Nc] += l2_norm_sq(diff, hs[Nc])
+
+    # Average over samples
+    for Nc in V:
+        V[Nc] /= M
+
+    # Prepare regression of log(V) vs log(N)
+    Ns = np.array(levels[:-1], dtype=float)
+    Vs = np.array([V[N] for N in levels[:-1]], dtype=float)
+    slope, intercept = np.polyfit(np.log(Ns), np.log(Vs), 1)
+
+    print("Level variances V(N):")
+    for N in levels[:-1]:
+        print(f"  N={N:3d}  V={V[N]:.6e}")
+    print()
+    print(f"Regression log(V) ~ slope*log(N) + intercept")
+    print(f"  slope = {slope:.4f}   (expect about -2 for V ~ N^{-2})")
+    print(f"  intercept = {intercept:.4f}")
+
+if __name__ == "__main__":
+    main()
